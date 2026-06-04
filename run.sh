@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# run.sh  –  convenient wrapper for organizer.py
+# run.sh  –  convenient wrapper for organizer.py and clean_empty_dirs.py
 #
 # Usage examples:
-#   ./run.sh -s ~/Photos/Raw -d ~/Photos/Organized
-#   ./run.sh -s /mnt/camera -d ~/Organized --duplicates ~/Dupes -t 20
+#   ./run.sh organize -s ~/Photos/Raw -d ~/Photos/Organized
+#   ./run.sh organize -s /mnt/camera -d ~/Organized --duplicates ~/Dupes -t 20
+#   ./run.sh clean ~/Photos/Organized
+#   ./run.sh clean --dry-run ~/Photos/Organized
 #   ./run.sh --help
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python3}"
-APP="$SCRIPT_DIR/organizer.py"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 if ! command -v "$PYTHON" &>/dev/null; then
@@ -25,19 +26,18 @@ if [[ "$PY_VERSION" != "True" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$APP" ]]; then
-  echo "ERROR: organizer.py not found at $APP" >&2
-  exit 1
-fi
-
-# ── Show help if no arguments ────────────────────────────────────────────────
-if [[ $# -eq 0 ]]; then
+# ── Help ──────────────────────────────────────────────────────────────────────
+print_help() {
   echo ""
-  echo "  File Organizer"
+  echo "  File Organizer Toolkit"
   echo "  ─────────────────────────────────────────────────────────────────"
-  echo "  Moves files from SOURCE to DESTINATION organized by date."
-  echo "  Duplicates are detected by content hash and moved separately."
   echo ""
+  echo "  COMMANDS:"
+  echo ""
+  echo "    organize   Move files into year/month folders by creation date"
+  echo "    clean      Delete empty directories (including empty subtrees)"
+  echo ""
+  echo "  ── organize ──────────────────────────────────────────────────────"
   echo "  Required:"
   echo "    -s, --source        <path>   Directory to scan"
   echo "    -d, --destination   <path>   Root output directory"
@@ -46,22 +46,42 @@ if [[ $# -eq 0 ]]; then
   echo "    --duplicates        <path>   Directory for duplicate files"
   echo "    -t, --threads       <int>    Worker threads (default: 10)"
   echo "    -v, --verbose                Enable debug logging"
-  echo "    -h, --help                   Show this help"
   echo ""
-  echo "  Output structure:"
-  echo "    <destination>/"
-  echo "      2024/"
-  echo "        06-June/"
-  echo "          15/"
-  echo "            photo.jpg"
-  echo "            document.pdf"
+  echo "  ── clean ─────────────────────────────────────────────────────────"
+  echo "  Required:"
+  echo "    <path>                       Directory to clean"
   echo ""
-  echo "  Examples:"
-  echo "    ./run.sh -s ~/Downloads -d ~/Organized"
-  echo "    ./run.sh -s ~/Downloads -d ~/Organized --duplicates ~/Dupes -t 20 -v"
+  echo "  Optional:"
+  echo "    --dry-run                    Preview deletions without removing"
+  echo "    -v, --verbose                Show kept directories too"
   echo ""
-  exit 0
-fi
+  echo "  EXAMPLES:"
+  echo "    ./run.sh organize -s ~/Downloads -d ~/Organized"
+  echo "    ./run.sh organize -s ~/Downloads -d ~/Organized --duplicates ~/Dupes -t 20"
+  echo "    ./run.sh clean ~/Organized"
+  echo "    ./run.sh clean --dry-run ~/Organized"
+  echo ""
+}
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-exec "$PYTHON" "$APP" "$@"
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+COMMAND="${1:-}"
+
+case "$COMMAND" in
+  organize)
+    shift
+    exec "$PYTHON" "$SCRIPT_DIR/organizer.py" "$@"
+    ;;
+  clean)
+    shift
+    exec "$PYTHON" "$SCRIPT_DIR/clean_empty_dirs.py" "$@"
+    ;;
+  --help|-h|help|"")
+    print_help
+    exit 0
+    ;;
+  *)
+    echo "ERROR: Unknown command '$COMMAND'. Use 'organize' or 'clean'." >&2
+    print_help
+    exit 1
+    ;;
+esac
