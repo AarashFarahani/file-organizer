@@ -5,7 +5,6 @@ Moves files from source to destination, organized by date (year/month/day).
 Duplicate files are moved to a separate duplicates directory.
 """
 
-import os
 import sys
 import shutil
 import hashlib
@@ -46,7 +45,6 @@ def creation_date(path: Path) -> datetime:
     Falls back to mtime on Linux where birthtime is unavailable.
     """
     stat = path.stat()
-    # macOS / Windows expose st_birthtime
     birth = getattr(stat, "st_birthtime", None)
     ts = birth if birth else stat.st_mtime
     return datetime.fromtimestamp(ts)
@@ -83,12 +81,10 @@ class Organizer:
         self._seen: Dict[str, Path] = {}
         self._lock = threading.Lock()
 
-        # counters
+        # counters (protected by _lock)
         self.moved = 0
         self.dupes = 0
         self.errors = 0
-
-    # ── collect ───────────────────────────────────────────────────────────────
 
     def collect_files(self) -> List[Path]:
         files = [
@@ -98,47 +94,53 @@ class Organizer:
         log.info("Found %d file(s) under %s", len(files), self.source)
         return files
 
-    # ── process single file ───────────────────────────────────────────────────
-
     def process(self, path: Path) -> None:
         try:
-            digest = file_hash(path)
+            # ── Heavy I/O done OUTSIDE the lock ──────────────────────────────
+            digest = file_hash(path)        # read entire file — no lock needed
             date = creation_date(path)
 
             year  = date.strftime("%Y")
-            month = date.strftime("%m")   # e.g. 02
+            month = date.strftime("%m")
             day   = date.strftime("%d")
 
+            # ── Lock only to check/update the seen-hash registry ─────────────
             with self._lock:
-                if digest in self._seen:
-                    # ── duplicate ────────────────────────────────────────────
-                    if self.duplicates is None:
-                        log.warning("DUPLICATE skipped (no duplicates dir): %s", path)
-                        return
+                is_duplicate = digest in self._seen
+                if not is_duplicate:
+                    # Reserve this hash so other threads don't race on it
+                    self._seen[digest] = None  # placeholder until move is done
 
-                    dest_dir = self.duplicates / year / month / day
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest = safe_dest_path(dest_dir, path.name)
-                    shutil.move(str(path), dest)
-                    self.dupes += 1
-                    log.info("DUPLICATE  %s  →  %s", path.name, dest)
+            # ── File move done OUTSIDE the lock ──────────────────────────────
+            if is_duplicate:
+                if self.duplicates is None:
+                    log.warning("DUPLICATE skipped (no duplicates dir): %s", path)
                     return
 
-                # ── new file ──────────────────────────────────────────────────
+                dest_dir = self.duplicates / year / month / day
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = safe_dest_path(dest_dir, path.name)
+                shutil.move(str(path), dest)
+
+                with self._lock:
+                    self.dupes += 1
+                log.info("DUPLICATE  %s  →  %s", path.name, dest)
+
+            else:
                 dest_dir = self.destination / year / month / day
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = safe_dest_path(dest_dir, path.name)
                 shutil.move(str(path), dest)
-                self._seen[digest] = dest
-                self.moved += 1
+
+                with self._lock:
+                    self._seen[digest] = dest   # update placeholder with real path
+                    self.moved += 1
                 log.info("MOVED      %s  →  %s", path.name, dest)
 
         except Exception as exc:
             with self._lock:
                 self.errors += 1
             log.error("ERROR processing %s: %s", path, exc)
-
-    # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self, threads: int = 10) -> None:
         files = self.collect_files()
@@ -150,7 +152,6 @@ class Organizer:
         with ThreadPoolExecutor(max_workers=threads) as pool:
             futures = {pool.submit(self.process, f): f for f in files}
             for future in as_completed(futures):
-                # exceptions are already caught inside process()
                 future.result()
 
         log.info(
@@ -166,32 +167,16 @@ def parse_args() -> argparse.Namespace:
         description="Organize files by creation date into year/month/day folders.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "-s", "--source",
-        required=True,
-        help="Source directory to scan recursively.",
-    )
-    parser.add_argument(
-        "-d", "--destination",
-        required=True,
-        help="Destination root directory (year/month/day structure created here).",
-    )
-    parser.add_argument(
-        "--duplicates",
-        default=None,
-        help="Directory for duplicate files. If omitted, duplicates are skipped.",
-    )
-    parser.add_argument(
-        "-t", "--threads",
-        type=int,
-        default=10,
-        help="Thread-pool size.",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable DEBUG logging.",
-    )
+    parser.add_argument("-s", "--source", required=True,
+                        help="Source directory to scan recursively.")
+    parser.add_argument("-d", "--destination", required=True,
+                        help="Destination root directory (year/month/day structure created here).")
+    parser.add_argument("--duplicates", default=None,
+                        help="Directory for duplicate files. If omitted, duplicates are skipped.")
+    parser.add_argument("-t", "--threads", type=int, default=10,
+                        help="Thread-pool size.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable DEBUG logging.")
     return parser.parse_args()
 
 
@@ -201,11 +186,10 @@ def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    source = Path(args.source)
+    source      = Path(args.source)
     destination = Path(args.destination)
-    duplicates = Path(args.duplicates) if args.duplicates else None
+    duplicates  = Path(args.duplicates) if args.duplicates else None
 
-    # Validate source
     if not source.exists():
         log.error("Source directory does not exist: %s", source)
         sys.exit(1)
@@ -213,13 +197,12 @@ def main() -> None:
         log.error("Source is not a directory: %s", source)
         sys.exit(1)
 
-    # Prevent source inside destination (or vice-versa)
     try:
         source.resolve().relative_to(destination.resolve())
         log.error("Source cannot be inside the destination directory.")
         sys.exit(1)
     except ValueError:
-        pass  # good – source is not under destination
+        pass
 
     destination.mkdir(parents=True, exist_ok=True)
     if duplicates:
