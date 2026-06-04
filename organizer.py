@@ -13,7 +13,7 @@ import argparse
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -27,33 +27,46 @@ log = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def file_hash(path: Path, chunk: int = 65_536) -> str:
-    """Return MD5 hex-digest of a file (fast duplicate detection)."""
-    h = hashlib.md5()
-    with open(path, "rb") as fh:
-        while True:
-            data = fh.read(chunk)
-            if not data:
-                break
-            h.update(data)
-    return h.hexdigest()
+def file_hash(path: Path, chunk: int = 65_536) -> Optional[str]:
+    """
+    Return MD5 hex-digest of a file.
+    Returns None and logs if the file cannot be read.
+    """
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as fh:
+            while True:
+                data = fh.read(chunk)
+                if not data:
+                    break
+                h.update(data)
+        return h.hexdigest()
+    except Exception as exc:
+        log.error("SKIP | cannot read file | file=%s | reason=%s", path, exc)
+        return None
 
 
-def creation_date(path: Path) -> datetime:
+def creation_date(path: Path) -> Optional[datetime]:
     """
     Return the best available creation/birth date for a file.
     Falls back to mtime on Linux where birthtime is unavailable.
+    Returns None and logs if stat fails.
     """
-    stat = path.stat()
-    birth = getattr(stat, "st_birthtime", None)
-    ts = birth if birth else stat.st_mtime
-    return datetime.fromtimestamp(ts)
+    try:
+        stat = path.stat()
+        birth = getattr(stat, "st_birthtime", None)
+        ts = birth if birth else stat.st_mtime
+        return datetime.fromtimestamp(ts)
+    except Exception as exc:
+        log.error("SKIP | cannot read date | file=%s | reason=%s", path, exc)
+        return None
 
 
 def safe_dest_path(dest_dir: Path, filename: str) -> Path:
     """
     Return a path inside dest_dir that does not already exist.
-    If <filename> is taken, append underscores: file_.jpg, file__.jpg …
+    Appends underscores to the stem until the name is free:
+      photo.jpg → photo_.jpg → photo__.jpg → …
     """
     stem = Path(filename).stem
     suffix = Path(filename).suffix
@@ -62,6 +75,22 @@ def safe_dest_path(dest_dir: Path, filename: str) -> Path:
         stem += "_"
         candidate = dest_dir / f"{stem}{suffix}"
     return candidate
+
+
+def move_file(src: Path, dest: Path) -> bool:
+    """
+    Move src to dest. Returns True on success, False on any failure.
+    The source file is NEVER deleted if the move fails.
+    """
+    try:
+        shutil.move(str(src), dest)
+        return True
+    except Exception as exc:
+        log.error(
+            "SKIP | cannot move file | file=%s | target=%s | reason=%s",
+            src, dest, exc,
+        )
+        return False
 
 
 # ── Core worker ───────────────────────────────────────────────────────────────
@@ -77,11 +106,18 @@ class Organizer:
         self.destination = destination.resolve()
         self.duplicates = duplicates.resolve() if duplicates else None
 
-        # hash → destination path (tracks files already moved)
+        # hash → destination path of the FIRST successfully moved file
+        # Never written until a move is confirmed successful
         self._seen: Dict[str, Path] = {}
+
+        # Tracks hashes currently being processed by another thread,
+        # so a racing thread waits rather than double-moving
+        self._in_flight: Set[str] = set()
+        self._in_flight_cond = threading.Condition()
+
         self._lock = threading.Lock()
 
-        # counters (protected by _lock)
+        # counters
         self.moved = 0
         self.dupes = 0
         self.errors = 0
@@ -95,51 +131,117 @@ class Organizer:
         return files
 
     def process(self, path: Path) -> None:
-        try:
-            # ── Heavy I/O done OUTSIDE the lock ──────────────────────────────
-            digest = file_hash(path)        # read entire file — no lock needed
-            date = creation_date(path)
-
-            year  = date.strftime("%Y")
-            month = date.strftime("%m")
-
-            # ── Lock only to check/update the seen-hash registry ─────────────
-            with self._lock:
-                is_duplicate = digest in self._seen
-                if not is_duplicate:
-                    # Reserve this hash so other threads don't race on it
-                    self._seen[digest] = None  # placeholder until move is done
-
-            # ── File move done OUTSIDE the lock ──────────────────────────────
-            if is_duplicate:
-                if self.duplicates is None:
-                    log.warning("DUPLICATE skipped (no duplicates dir): %s", path)
-                    return
-
-                dest_dir = self.duplicates / year / month
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = safe_dest_path(dest_dir, path.name)
-                shutil.move(str(path), dest)
-
-                with self._lock:
-                    self.dupes += 1
-                log.info("DUPLICATE  %s  →  %s", path.name, dest)
-
-            else:
-                dest_dir = self.destination / year / month
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = safe_dest_path(dest_dir, path.name)
-                shutil.move(str(path), dest)
-
-                with self._lock:
-                    self._seen[digest] = dest   # update placeholder with real path
-                    self.moved += 1
-                log.info("MOVED      %s  →  %s", path.name, dest)
-
-        except Exception as exc:
+        # ── Phase 1: read — no lock, file never mutated here ─────────────────
+        digest = file_hash(path)
+        if digest is None:
             with self._lock:
                 self.errors += 1
-            log.error("ERROR processing %s: %s", path, exc)
+            return  # already logged inside file_hash
+
+        date = creation_date(path)
+        if date is None:
+            with self._lock:
+                self.errors += 1
+            return  # already logged inside creation_date
+
+        year  = date.strftime("%Y")
+        month = date.strftime("%m")
+
+        # ── Phase 2: wait if another thread is mid-move for the same hash ────
+        # This prevents a race where two identical files both look "new"
+        # because neither has finished moving yet when the other checks _seen.
+        with self._in_flight_cond:
+            while digest in self._in_flight:
+                self._in_flight_cond.wait()
+            # Safe to proceed: either already in _seen (duplicate) or truly new
+            self._in_flight.add(digest)
+
+        try:
+            # ── Phase 3: decide new vs duplicate ─────────────────────────────
+            with self._lock:
+                is_duplicate = digest in self._seen
+                first_seen_at = self._seen.get(digest)
+
+            if is_duplicate:
+                self._handle_duplicate(path, year, month, first_seen_at)
+            else:
+                self._handle_new(path, year, month, digest)
+
+        finally:
+            # Always release the in-flight slot so waiting threads unblock
+            with self._in_flight_cond:
+                self._in_flight.discard(digest)
+                self._in_flight_cond.notify_all()
+
+    def _handle_new(self, path: Path, year: str, month: str, digest: str) -> None:
+        dest_dir = self.destination / year / month
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            log.error(
+                "SKIP | cannot create destination directory | dir=%s | reason=%s",
+                dest_dir, exc,
+            )
+            with self._lock:
+                self.errors += 1
+            return  # file untouched
+
+        dest = safe_dest_path(dest_dir, path.name)
+
+        if not move_file(path, dest):
+            # move_file already logged the error
+            with self._lock:
+                self.errors += 1
+            return  # do NOT register hash — move never happened
+
+        # Only register hash after confirmed successful move
+        with self._lock:
+            self._seen[digest] = dest
+            self.moved += 1
+        log.info("MOVED | file=%s | dest=%s", path.name, dest)
+
+    def _handle_duplicate(
+        self,
+        path: Path,
+        year: str,
+        month: str,
+        first_seen_at: Optional[Path],
+    ) -> None:
+        if self.duplicates is None:
+            log.warning(
+                "DUPLICATE skipped (no --duplicates dir) | file=%s | original=%s",
+                path, first_seen_at,
+            )
+            return
+
+        dest_dir = self.duplicates / year / month
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            log.error(
+                "SKIP | cannot create duplicates directory | dir=%s | reason=%s",
+                dest_dir, exc,
+            )
+            with self._lock:
+                self.errors += 1
+            return  # file untouched
+
+        dest = safe_dest_path(dest_dir, path.name)
+
+        if not move_file(path, dest):
+            # move_file already logged; leave file in place
+            with self._lock:
+                self.errors += 1
+            return
+
+        with self._lock:
+            self.dupes += 1
+        log.info(
+            "DUPLICATE | file=%s | original=%s | moved_to=%s",
+            path.name, first_seen_at, dest,
+        )
 
     def run(self, threads: int = 10) -> None:
         files = self.collect_files()
