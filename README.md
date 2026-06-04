@@ -4,7 +4,7 @@ Recursively scans a source directory and moves every file into a date-based fold
 
 ## Features
 
-- **Date-based organisation** — `<destination>/YYYY/MM/DD/`
+- **Date-based organisation** — `<destination>/YYYY/MM/`
 - **Duplicate detection** — content-hash (MD5) comparison, not just filenames
 - **Safe naming** — clashing names get underscores appended (`photo_.jpg`, `photo__.jpg` …)
 - **Multithreaded** — configurable thread pool (default 10)
@@ -47,19 +47,16 @@ chmod +x run.sh
 <destination>/
   2024/
     06/
-      15/
-        IMG_001.jpg
-        document.pdf
+      IMG_001.jpg
+      document.pdf
   2023/
     12/
-      25/
-        family_photo.jpg
+      family_photo.jpg
 
 <duplicates>/          ← only when --duplicates is supplied
   2024/
     06/
-      15/
-        IMG_001_.jpg   ← underscore appended to avoid clash
+      IMG_001_.jpg     ← underscore appended to avoid clash
 ```
 
 ## Running directly with Python

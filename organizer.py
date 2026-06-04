@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 File Organizer
-Moves files from source to destination, organized by date (year/month/day).
+Moves files from source to destination, organized by date (year/month).
 Duplicate files are moved to a separate duplicates directory.
 """
 
@@ -102,7 +102,6 @@ class Organizer:
 
             year  = date.strftime("%Y")
             month = date.strftime("%m")
-            day   = date.strftime("%d")
 
             # ── Lock only to check/update the seen-hash registry ─────────────
             with self._lock:
@@ -117,7 +116,7 @@ class Organizer:
                     log.warning("DUPLICATE skipped (no duplicates dir): %s", path)
                     return
 
-                dest_dir = self.duplicates / year / month / day
+                dest_dir = self.duplicates / year / month
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = safe_dest_path(dest_dir, path.name)
                 shutil.move(str(path), dest)
@@ -127,7 +126,7 @@ class Organizer:
                 log.info("DUPLICATE  %s  →  %s", path.name, dest)
 
             else:
-                dest_dir = self.destination / year / month / day
+                dest_dir = self.destination / year / month
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = safe_dest_path(dest_dir, path.name)
                 shutil.move(str(path), dest)
@@ -164,13 +163,13 @@ class Organizer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Organize files by creation date into year/month/day folders.",
+        description="Organize files by creation date into year/month folders.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-s", "--source", required=True,
                         help="Source directory to scan recursively.")
     parser.add_argument("-d", "--destination", required=True,
-                        help="Destination root directory (year/month/day structure created here).")
+                        help="Destination root directory (year/month structure created here).")
     parser.add_argument("--duplicates", default=None,
                         help="Directory for duplicate files. If omitted, duplicates are skipped.")
     parser.add_argument("-t", "--threads", type=int, default=10,
