@@ -2,18 +2,24 @@
 """
 File Organizer
 Moves files from source to destination, organized by date (year/month).
+Date is extracted from filename first, falls back to file creation date.
+After a successful move, sets both creation date and modified date on macOS.
 Duplicate files are moved to a separate duplicates directory.
 """
 
+import os
+import re
 import sys
 import shutil
 import hashlib
 import logging
 import argparse
+import platform
+import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -25,13 +31,156 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Date patterns to try against filenames (in priority order) ───────────────
+
+FILENAME_DATE_PATTERNS: List[Tuple[re.Pattern, str, str]] = [
+    # 2025-07-26 17.58.48  (Documents by Readdle, Screenshot style)
+    (
+        re.compile(r"(?P<dt>\d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2})"),
+        "%Y-%m-%d %H.%M.%S",
+        "YYYY-MM-DD HH.MM.SS",
+    ),
+    # 2025-07-26 17:58:48
+    (
+        re.compile(r"(?P<dt>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"),
+        "%Y-%m-%d %H:%M:%S",
+        "YYYY-MM-DD HH:MM:SS",
+    ),
+    # 2025-07-26_17-58-48
+    (
+        re.compile(r"(?P<dt>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})"),
+        "%Y-%m-%d_%H-%M-%S",
+        "YYYY-MM-DD_HH-MM-SS",
+    ),
+    # 20250726_175848  (WhatsApp, Samsung, many Android cameras)
+    (
+        re.compile(r"(?P<dt>\d{8}_\d{6})"),
+        "%Y%m%d_%H%M%S",
+        "YYYYMMDD_HHMMSS",
+    ),
+    # 20250726175848
+    (
+        re.compile(r"(?P<dt>\d{14})"),
+        "%Y%m%d%H%M%S",
+        "YYYYMMDDHHMMSS",
+    ),
+    # 2025-07-26  (date only)
+    (
+        re.compile(r"(?P<dt>\d{4}-\d{2}-\d{2})"),
+        "%Y-%m-%d",
+        "YYYY-MM-DD",
+    ),
+    # 20250726  (date only, compact)
+    (
+        re.compile(r"(?P<dt>\d{8})"),
+        "%Y%m%d",
+        "YYYYMMDD",
+    ),
+]
+
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
+
+def date_from_filename(path: Path) -> Optional[datetime]:
+    """Try to extract a date from the filename. Returns None if no pattern matched."""
+    name = path.stem
+    for pattern, fmt, description in FILENAME_DATE_PATTERNS:
+        m = pattern.search(name)
+        if m:
+            raw = m.group("dt")
+            try:
+                dt = datetime.strptime(raw, fmt)
+                log.debug(
+                    "DATE from filename | file=%s | pattern=%s | parsed=%s",
+                    path.name, description, dt,
+                )
+                return dt
+            except ValueError:
+                continue
+    return None
+
+
+def date_from_filesystem(path: Path) -> Optional[datetime]:
+    """Return st_birthtime (macOS) or st_mtime fallback. None on failure."""
+    try:
+        stat = path.stat()
+        birth = getattr(stat, "st_birthtime", None)
+        ts = birth if birth else stat.st_mtime
+        return datetime.fromtimestamp(ts)
+    except Exception as exc:
+        log.error("SKIP | cannot read filesystem date | file=%s | reason=%s", path, exc)
+        return None
+
+
+def resolve_date(path: Path, prefer_filename: bool) -> Optional[datetime]:
+    """Return the date to use for organising this file."""
+    if prefer_filename:
+        dt = date_from_filename(path)
+        if dt:
+            return dt
+        log.debug("No date in filename, falling back to filesystem | file=%s", path.name)
+    return date_from_filesystem(path)
+
+
+# ── Date stamping ─────────────────────────────────────────────────────────────
+
+IS_MACOS = platform.system() == "Darwin"
+
+
+def set_file_dates(path: Path, dt: datetime) -> None:
+    """
+    Set both the modification date and the creation (birth) date of a file.
+
+    Modified date : set via os.utime() — works on all platforms.
+    Creation date : set via osascript — macOS only.
+
+    Failures are logged as warnings; they never abort the organizer.
+    """
+    ts = dt.timestamp()
+
+    # ── Modified date (cross-platform) ───────────────────────────────────────
+    try:
+        os.utime(path, (ts, ts))
+        log.debug("DATE SET modified | file=%s | date=%s", path.name, dt)
+    except Exception as exc:
+        log.warning(
+            "Could not set modified date | file=%s | reason=%s", path, exc
+        )
+
+    # ── Creation date (macOS only via osascript) ──────────────────────────────
+    if not IS_MACOS:
+        return
+
+    # osascript expects: "MM/DD/YYYY HH:MM:SS"
+    mac_date = dt.strftime("%m/%d/%Y %H:%M:%S")
+    script = (
+        f'tell application "Finder" to '
+        f'set creation date of (POSIX file "{path}") to date "{mac_date}"'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "Could not set creation date | file=%s | osascript error=%s",
+                path, result.stderr.strip(),
+            )
+        else:
+            log.debug("DATE SET creation | file=%s | date=%s", path.name, dt)
+    except subprocess.TimeoutExpired:
+        log.warning("Could not set creation date | file=%s | reason=osascript timeout", path)
+    except Exception as exc:
+        log.warning("Could not set creation date | file=%s | reason=%s", path, exc)
+
+
+# ── File helpers ──────────────────────────────────────────────────────────────
 
 def file_hash(path: Path, chunk: int = 65_536) -> Optional[str]:
-    """
-    Return MD5 hex-digest of a file.
-    Returns None and logs if the file cannot be read.
-    """
+    """Return MD5 hex-digest. Returns None and logs on read failure."""
     try:
         h = hashlib.md5()
         with open(path, "rb") as fh:
@@ -46,27 +195,10 @@ def file_hash(path: Path, chunk: int = 65_536) -> Optional[str]:
         return None
 
 
-def creation_date(path: Path) -> Optional[datetime]:
-    """
-    Return the best available creation/birth date for a file.
-    Falls back to mtime on Linux where birthtime is unavailable.
-    Returns None and logs if stat fails.
-    """
-    try:
-        stat = path.stat()
-        birth = getattr(stat, "st_birthtime", None)
-        ts = birth if birth else stat.st_mtime
-        return datetime.fromtimestamp(ts)
-    except Exception as exc:
-        log.error("SKIP | cannot read date | file=%s | reason=%s", path, exc)
-        return None
-
-
 def safe_dest_path(dest_dir: Path, filename: str) -> Path:
     """
-    Return a path inside dest_dir that does not already exist.
-    Appends underscores to the stem until the name is free:
-      photo.jpg → photo_.jpg → photo__.jpg → …
+    Return a free path inside dest_dir.
+    photo.jpg → photo_.jpg → photo__.jpg → …
     """
     stem = Path(filename).stem
     suffix = Path(filename).suffix
@@ -78,10 +210,7 @@ def safe_dest_path(dest_dir: Path, filename: str) -> Path:
 
 
 def move_file(src: Path, dest: Path) -> bool:
-    """
-    Move src to dest. Returns True on success, False on any failure.
-    The source file is NEVER deleted if the move fails.
-    """
+    """Move src to dest. Returns True on success; logs and returns False on any failure."""
     try:
         shutil.move(str(src), dest)
         return True
@@ -101,23 +230,20 @@ class Organizer:
         source: Path,
         destination: Path,
         duplicates: Optional[Path],
+        prefer_filename_date: bool = True,
+        update_dates: bool = True,
     ):
         self.source = source.resolve()
         self.destination = destination.resolve()
         self.duplicates = duplicates.resolve() if duplicates else None
+        self.prefer_filename_date = prefer_filename_date
+        self.update_dates = update_dates
 
-        # hash → destination path of the FIRST successfully moved file
-        # Never written until a move is confirmed successful
         self._seen: Dict[str, Path] = {}
-
-        # Tracks hashes currently being processed by another thread,
-        # so a racing thread waits rather than double-moving
         self._in_flight: Set[str] = set()
         self._in_flight_cond = threading.Condition()
-
         self._lock = threading.Lock()
 
-        # counters
         self.moved = 0
         self.dupes = 0
         self.errors = 0
@@ -131,71 +257,66 @@ class Organizer:
         return files
 
     def process(self, path: Path) -> None:
-        # ── Phase 1: read — no lock, file never mutated here ─────────────────
+        # ── Phase 1: read — file never mutated ───────────────────────────────
         digest = file_hash(path)
         if digest is None:
             with self._lock:
                 self.errors += 1
-            return  # already logged inside file_hash
+            return
 
-        date = creation_date(path)
+        date = resolve_date(path, self.prefer_filename_date)
         if date is None:
             with self._lock:
                 self.errors += 1
-            return  # already logged inside creation_date
+            return
 
         year  = date.strftime("%Y")
         month = date.strftime("%m")
 
-        # ── Phase 2: wait if another thread is mid-move for the same hash ────
-        # This prevents a race where two identical files both look "new"
-        # because neither has finished moving yet when the other checks _seen.
+        # ── Phase 2: serialize threads with the same hash ────────────────────
         with self._in_flight_cond:
             while digest in self._in_flight:
                 self._in_flight_cond.wait()
-            # Safe to proceed: either already in _seen (duplicate) or truly new
             self._in_flight.add(digest)
 
         try:
-            # ── Phase 3: decide new vs duplicate ─────────────────────────────
             with self._lock:
                 is_duplicate = digest in self._seen
                 first_seen_at = self._seen.get(digest)
 
             if is_duplicate:
-                self._handle_duplicate(path, year, month, first_seen_at)
+                self._handle_duplicate(path, date, year, month, first_seen_at)
             else:
-                self._handle_new(path, year, month, digest)
-
+                self._handle_new(path, date, year, month, digest)
         finally:
-            # Always release the in-flight slot so waiting threads unblock
             with self._in_flight_cond:
                 self._in_flight.discard(digest)
                 self._in_flight_cond.notify_all()
 
-    def _handle_new(self, path: Path, year: str, month: str, digest: str) -> None:
+    def _handle_new(
+        self, path: Path, date: datetime, year: str, month: str, digest: str
+    ) -> None:
         dest_dir = self.destination / year / month
-
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             log.error(
-                "SKIP | cannot create destination directory | dir=%s | reason=%s",
-                dest_dir, exc,
+                "SKIP | cannot create destination dir | dir=%s | reason=%s", dest_dir, exc
             )
             with self._lock:
                 self.errors += 1
-            return  # file untouched
+            return
 
         dest = safe_dest_path(dest_dir, path.name)
-
         if not move_file(path, dest):
-            # move_file already logged the error
             with self._lock:
                 self.errors += 1
-            return  # do NOT register hash — move never happened
+            return
 
-        # Only register hash after confirmed successful move
+        # Update dates only after confirmed successful move
+        if self.update_dates:
+            set_file_dates(dest, date)
+
         with self._lock:
             self._seen[digest] = dest
             self.moved += 1
@@ -204,6 +325,7 @@ class Organizer:
     def _handle_duplicate(
         self,
         path: Path,
+        date: datetime,
         year: str,
         month: str,
         first_seen_at: Optional[Path],
@@ -216,25 +338,25 @@ class Organizer:
             return
 
         dest_dir = self.duplicates / year / month
-
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             log.error(
-                "SKIP | cannot create duplicates directory | dir=%s | reason=%s",
-                dest_dir, exc,
+                "SKIP | cannot create duplicates dir | dir=%s | reason=%s", dest_dir, exc
             )
             with self._lock:
                 self.errors += 1
-            return  # file untouched
+            return
 
         dest = safe_dest_path(dest_dir, path.name)
-
         if not move_file(path, dest):
-            # move_file already logged; leave file in place
             with self._lock:
                 self.errors += 1
             return
+
+        # Update dates on duplicates too
+        if self.update_dates:
+            set_file_dates(dest, date)
 
         with self._lock:
             self.dupes += 1
@@ -265,17 +387,29 @@ class Organizer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Organize files by creation date into year/month folders.",
+        description="Organize files by date into year/month folders.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-s", "--source", required=True,
                         help="Source directory to scan recursively.")
     parser.add_argument("-d", "--destination", required=True,
-                        help="Destination root directory (year/month structure created here).")
+                        help="Destination root directory.")
     parser.add_argument("--duplicates", default=None,
-                        help="Directory for duplicate files. If omitted, duplicates are skipped.")
+                        help="Directory for duplicate files. Skipped if omitted.")
     parser.add_argument("-t", "--threads", type=int, default=10,
                         help="Thread-pool size.")
+    parser.add_argument(
+        "--use-filesystem-date",
+        action="store_true",
+        default=False,
+        help="Always use filesystem date. Default: try filename first, fall back to filesystem.",
+    )
+    parser.add_argument(
+        "--no-update-dates",
+        action="store_true",
+        default=False,
+        help="Skip updating creation/modified dates after move. Default: dates are updated.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable DEBUG logging.")
     return parser.parse_args()
@@ -290,6 +424,8 @@ def main() -> None:
     source      = Path(args.source)
     destination = Path(args.destination)
     duplicates  = Path(args.duplicates) if args.duplicates else None
+    prefer_filename_date = not args.use_filesystem_date
+    update_dates = not args.no_update_dates
 
     if not source.exists():
         log.error("Source directory does not exist: %s", source)
@@ -309,7 +445,19 @@ def main() -> None:
     if duplicates:
         duplicates.mkdir(parents=True, exist_ok=True)
 
-    organizer = Organizer(source, destination, duplicates)
+    date_mode = "filename → filesystem fallback" if prefer_filename_date else "filesystem only"
+    log.info("Date mode: %s", date_mode)
+    if update_dates:
+        log.info("Date stamping: enabled (creation + modified)%s",
+                 " [macOS]" if IS_MACOS else " [modified only — not macOS]")
+    else:
+        log.info("Date stamping: disabled")
+
+    organizer = Organizer(
+        source, destination, duplicates,
+        prefer_filename_date=prefer_filename_date,
+        update_dates=update_dates,
+    )
     organizer.run(threads=args.threads)
 
 
